@@ -1,0 +1,6 @@
+{
+  "name": "Shop Catalog System",
+  "description": "A master product catalog builder and shareable visual display system for shop owners and workers, enabling direct WhatsApp and phone outreach.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
