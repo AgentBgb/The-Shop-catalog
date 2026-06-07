@@ -4,7 +4,12 @@ import path from 'path';
 import fs from 'fs';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { createServer as createViteServer } from 'vite';
+let createViteServer: any;
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  import('vite').then(m => {
+    createViteServer = m.createServer;
+  }).catch(e => console.error('Vite import failed.'));
+}
 import { v2 as cloudinary } from 'cloudinary';
 import { db, User, Product, Catalog, Settings } from './server/db.js';
 const app = express();
@@ -836,7 +841,11 @@ app.get('/redoc', (req, res) => {
 // Vite Single-Page Application Fallback Middleware
 // -------------------------------------------------------------
 async function startViteServer() {
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    if (!createViteServer) {
+      const { createServer } = await import('vite');
+      createViteServer = createServer;
+    }
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
