@@ -16,9 +16,17 @@ app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 // Setup local uploads storage and serving
-const uploadsDir = path.join(process.cwd(), 'data', 'uploads');
+const isVercel = process.env.VERCEL === '1' || !!process.env.VERCEL;
+const uploadsDir = isVercel
+  ? path.join('/tmp', 'uploads')
+  : path.join(process.cwd(), 'data', 'uploads');
+
 if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+  try {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  } catch (err) {
+    console.error('Failed to create uploads directory:', err);
+  }
 }
 app.use('/uploads', express.static(uploadsDir));
 
@@ -889,6 +897,14 @@ async function startViteServer() {
   });
 }
 
-startViteServer().catch(err => {
-  console.error('Initialization failure during Vite middleware boot:', err);
-});
+// Start Vite Server or Export App for Vercel
+if (process.env.VERCEL) {
+  // When running on Vercel, we just export the Express app for Serverless Functions
+  console.log('Exporting Express app for Vercel...');
+} else {
+  startViteServer().catch(err => {
+    console.error('Initialization failure during Vite middleware boot:', err);
+  });
+}
+
+export default app;
