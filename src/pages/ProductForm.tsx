@@ -19,6 +19,7 @@ export default function ProductForm() {
   const [description, setDescription] = useState('');
   const [category, setCategory] = useState('Mobiles');
   const [customCategory, setCustomCategory] = useState('');
+  const [price, setPrice] = useState<number | ''>('');
   const [showCustomCat, setShowCustomCat] = useState(false);
   const [images, setImages] = useState<string[]>([]);
 
@@ -40,6 +41,7 @@ export default function ProductForm() {
         if (prod) {
           setName(prod.name);
           setDescription(prod.description);
+          setPrice(prod.price ?? '');
           setImages(prod.images || []);
           
           if (defaultCategories.includes(prod.category)) {
@@ -74,6 +76,7 @@ export default function ProductForm() {
       description: description.trim(),
       category: finalCategory,
       images, // Base64 or standard URLs
+      price: typeof price === 'number' ? price : undefined,
     };
 
     setSubmitting(true);
@@ -140,6 +143,20 @@ export default function ProductForm() {
                 onChange={(e) => setName(e.target.value)}
                 className="px-4 py-3 bg-slate-50 border border-slate-100 hover:border-slate-200 focus:border-indigo-500 focus:bg-white rounded-2xl text-sm font-medium text-slate-800 transition-all outline-none"
                 id="form-product-name"
+              />
+            </div>
+
+            <div className="flex flex-col space-y-1">
+              <label className="text-sm font-semibold text-slate-700">Price (₹)</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                placeholder="0.00"
+                value={price}
+                onChange={(e) => setPrice(e.target.value === '' ? '' : parseFloat(e.target.value))}
+                className="px-4 py-3 bg-slate-50 border border-slate-100 hover:border-slate-200 focus:border-indigo-500 focus:bg-white rounded-2xl text-sm font-medium text-slate-800 transition-all outline-none"
+                id="form-product-price"
               />
             </div>
 

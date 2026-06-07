@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -6,9 +7,9 @@ import jwt from 'jsonwebtoken';
 import { createServer as createViteServer } from 'vite';
 import { v2 as cloudinary } from 'cloudinary';
 import { db, User, Product, Catalog, Settings } from './server/db.js';
-
 const app = express();
-const PORT = 3000;
+// Allow overriding the port via environment variable. Default to 8080 per user request.
+const PORT = parseInt(process.env.PORT || '8080', 10);
 
 // Setup JSON body parsing with large limit for image upload
 app.use(express.json({ limit: '15mb' }));
@@ -50,44 +51,78 @@ const ACCESS_TOKEN_EXPIRE_MINUTES = parseInt(process.env.ACCESS_TOKEN_EXPIRE_MIN
 
 // Simple logging for request auditing
 app.use((req, res, next) => {
-  console.log(`[AUDIT] ${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
+  // Avoid logging a noisy stream of Vite / node_modules requests in dev.
+  // These are static ESM module requests (icons, assets) and don't need
+  // to appear in the main audit stream.
+  const noisyPrefixes = ['/node_modules/', '/@vite/', '/@fs/', '/favicon.ico', '/assets/', '/uploads/'];
+  const url = req.originalUrl || req.url || '';
+  if (!noisyPrefixes.some(p => url.startsWith(p))) {
+    console.log(`[AUDIT] ${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
+  }
   next();
 });
 
 // Helper: Base64 image uploader
 async function handleImageUpload(base64Str: string): Promise<string> {
   if (!base64Str) return '';
-  if (!base64Str.startsWith('data:image/')) {
-    // If it's already a URL, return directly
-    return base64Str;
-  }
+  // If it's a base64 data URL, upload that data (or fallback to local)
+  if (base64Str.startsWith('data:image/')) {
+    if (isCloudinaryConfigured) {
+      try {
+        const res = await cloudinary.uploader.upload(base64Str, {
+          folder: 'shop_catalogs',
+        });
+        return res.secure_url;
+      } catch (e) {
+        console.error('Cloudinary upload failure for base64 image, attempting local fallback:', e);
+      }
+    }
 
-  if (isCloudinaryConfigured) {
     try {
-      const res = await cloudinary.uploader.upload(base64Str, {
-        folder: 'shop_catalogs',
-      });
-      return res.secure_url;
-    } catch (e) {
-      console.error('Cloudinary upload failure, attempting local fallback:', e);
+      const match = base64Str.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
+      if (!match) return base64Str;
+      const ext = match[1] || 'png';
+      const data = match[2];
+      const buffer = Buffer.from(data, 'base64');
+      const filename = `img_${Date.now()}_${Math.random().toString(36).substr(2, 5)}.${ext}`;
+      fs.writeFileSync(path.join(uploadsDir, filename), buffer);
+      return `/uploads/${filename}`;
+    } catch (err) {
+      console.error('Local image save operation failed for base64:', err);
+      return 'https://picsum.photos/seed/placeholder/600/400';
     }
   }
 
-  // Fallback to local files
-  try {
-    const match = base64Str.match(/^data:image\/([a-zA-Z0-9]+);base64,(.+)$/);
-    if (!match) return base64Str;
-    const ext = match[1] || 'png';
-    const data = match[2];
-    const buffer = Buffer.from(data, 'base64');
-    const filename = `img_${Date.now()}_${Math.random().toString(36).substr(2, 5)}.${ext}`;
-    
-    fs.writeFileSync(path.join(uploadsDir, filename), buffer);
-    return `/uploads/${filename}`;
-  } catch (err) {
-    console.error('Local image save operation failed:', err);
-    return 'https://picsum.photos/seed/placeholder/600/400';
+  // Non-base64 input: it might be a full URL (http/https) or a local uploads path.
+  // If it's a remote URL, return as-is. If it's a local file path and Cloudinary is configured,
+  // attempt to upload the local file and return the Cloudinary URL.
+  const trimmed = base64Str.trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return trimmed;
   }
+
+  // Treat paths beginning with /uploads or relative uploads paths as local files
+  const possibleLocal = trimmed.startsWith('/uploads') || trimmed.startsWith('uploads') || trimmed.startsWith('.') || path.isAbsolute(trimmed);
+  if (possibleLocal) {
+    const localPath = path.isAbsolute(trimmed) ? trimmed : path.join(process.cwd(), trimmed.startsWith('/') ? trimmed.substr(1) : trimmed);
+    if (fs.existsSync(localPath)) {
+      if (isCloudinaryConfigured) {
+        try {
+          const res = await cloudinary.uploader.upload(localPath, { folder: 'shop_catalogs' });
+          return res.secure_url;
+        } catch (e) {
+          console.error('Cloudinary upload failure for local file, returning local path:', e);
+          return trimmed;
+        }
+      }
+      return trimmed;
+    }
+    // If file doesn't exist, return as-is
+    return trimmed;
+  }
+
+  // Otherwise, just return the input unchanged
+  return trimmed;
 }
 
 // Authentication Middleware
@@ -140,14 +175,14 @@ function workerOrOwnerRequired(req: express.Request, res: express.Response, next
 // -------------------------------------------------------------
 // Authentication Endpoint
 // -------------------------------------------------------------
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     res.status(400).json({ error: 'Email and password are required' });
     return;
   }
 
-  const user = db.getUserByEmail(email);
+  const user = await db.getUserByEmail(email);
   if (!user) {
     res.status(401).json({ error: 'Invalid credentials' });
     return;
@@ -189,9 +224,9 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // Support standard redundant FastAPI-style /auth/login for direct compliance
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
-  const user = db.getUserByEmail(email);
+  const user = await db.getUserByEmail(email);
   if (!user || !user.is_active || !bcrypt.compareSync(password, user.password_hash)) {
     res.status(401).json({ error: 'Invalid credentials' });
     return;
@@ -205,14 +240,14 @@ app.post('/auth/login', (req, res) => {
 // -------------------------------------------------------------
 // Worker Management APIs (Owner Only)
 // -------------------------------------------------------------
-app.post('/api/workers', authenticateToken, ownerRequired, (req, res) => {
+app.post('/api/workers', authenticateToken, ownerRequired, async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) {
     res.status(400).json({ error: 'Name, email, and password are required' });
     return;
   }
 
-  const existing = db.getUserByEmail(email);
+  const existing = await db.getUserByEmail(email);
   if (existing) {
     res.status(400).json({ error: 'Worker email address is already in use' });
     return;
@@ -231,7 +266,7 @@ app.post('/api/workers', authenticateToken, ownerRequired, (req, res) => {
     created_at: new Date().toISOString(),
   };
 
-  db.saveUser(newWorker);
+  await db.saveUser(newWorker);
   res.status(201).json({
     _id: newWorker._id,
     name: newWorker.name,
@@ -243,13 +278,13 @@ app.post('/api/workers', authenticateToken, ownerRequired, (req, res) => {
 });
 
 // Supports redundant path /workers
-app.post('/workers', authenticateToken, ownerRequired, (req, res) => {
+app.post('/workers', authenticateToken, ownerRequired, async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password) {
     res.status(400).json({ error: 'Name, email, and password are required' });
     return;
   }
-  const existing = db.getUserByEmail(email);
+  const existing = await db.getUserByEmail(email);
   if (existing) {
     res.status(400).json({ error: 'Worker email already exists' });
     return;
@@ -264,12 +299,13 @@ app.post('/workers', authenticateToken, ownerRequired, (req, res) => {
     is_active: true,
     created_at: new Date().toISOString(),
   };
-  db.saveUser(newWorker);
+  await db.saveUser(newWorker);
   res.status(201).json(newWorker);
 });
 
-app.get('/api/workers', authenticateToken, ownerRequired, (req, res) => {
-  const workers = db.getUsers().filter(u => u.role === 'worker');
+app.get('/api/workers', authenticateToken, ownerRequired, async (req, res) => {
+  const users = await db.getUsers();
+  const workers = users.filter(u => u.role === 'worker');
   res.json(workers.map(w => ({
     _id: w._id,
     name: w.name,
@@ -280,23 +316,24 @@ app.get('/api/workers', authenticateToken, ownerRequired, (req, res) => {
 });
 
 // Supports redundant path /workers
-app.get('/workers', authenticateToken, ownerRequired, (req, res) => {
-  const workers = db.getUsers().filter(u => u.role === 'worker');
+app.get('/workers', authenticateToken, ownerRequired, async (req, res) => {
+  const users = await db.getUsers();
+  const workers = users.filter(u => u.role === 'worker');
   res.json(workers);
 });
 
-app.patch('/api/workers/:id/status', authenticateToken, ownerRequired, (req, res) => {
+app.patch('/api/workers/:id/status', authenticateToken, ownerRequired, async (req, res) => {
   const { id } = req.params;
   const { is_active } = req.body;
 
-  const worker = db.getUserById(id);
+  const worker = await db.getUserById(id);
   if (!worker || worker.role !== 'worker') {
     res.status(404).json({ error: 'Worker not found' });
     return;
   }
 
   worker.is_active = typeof is_active === 'boolean' ? is_active : !worker.is_active;
-  db.saveUser(worker);
+  await db.saveUser(worker);
 
   res.json({
     _id: worker._id,
@@ -307,23 +344,56 @@ app.patch('/api/workers/:id/status', authenticateToken, ownerRequired, (req, res
 });
 
 // Supports redundant path /workers/{id}/status
-app.patch('/workers/:id/status', authenticateToken, ownerRequired, (req, res) => {
+app.patch('/workers/:id/status', authenticateToken, ownerRequired, async (req, res) => {
   const { id } = req.params;
-  const worker = db.getUserById(id);
+  const worker = await db.getUserById(id);
   if (!worker) {
     res.status(404).json({ error: 'Worker not found' });
     return;
   }
   worker.is_active = typeof req.body.is_active === 'boolean' ? req.body.is_active : !worker.is_active;
-  db.saveUser(worker);
+  await db.saveUser(worker);
   res.json(worker);
 });
 
 // -------------------------------------------------------------
 // Product APIs (Owner only for mutations, Owner/Worker for read)
 // -------------------------------------------------------------
+// Helper: migrate a product's local images to Cloudinary when configured
+async function migrateProductImages(product: Product | null): Promise<void> {
+  if (!product || !product.images || !isCloudinaryConfigured) return;
+  let updated = false;
+  const newImages: string[] = [];
+  for (const img of product.images) {
+    if (!img) continue;
+    // If likely a local path, attempt to upload
+    if (img.startsWith('/uploads') || img.startsWith('uploads') || !img.startsWith('http://') && !img.startsWith('https://')) {
+      try {
+        const uploaded = await handleImageUpload(img);
+        if (uploaded && uploaded !== img) {
+          newImages.push(uploaded);
+          updated = true;
+          continue;
+        }
+      } catch (e) {
+        console.error('Failed to migrate product image to Cloudinary:', e);
+      }
+    }
+    newImages.push(img);
+  }
+
+  if (updated) {
+    product.images = newImages;
+    try {
+      await db.saveProduct(product);
+    } catch (e) {
+      console.error('Failed to save product after migrating images:', e);
+    }
+  }
+}
+
 app.post('/api/products', authenticateToken, ownerRequired, async (req, res) => {
-  const { name, description, category, images } = req.body;
+  const { name, description, category, images, price } = req.body;
   if (!name) {
     res.status(400).json({ error: 'Product name is required' });
     return;
@@ -344,13 +414,14 @@ app.post('/api/products', authenticateToken, ownerRequired, async (req, res) => 
       _id: `product_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       name,
       description: description || '',
+      price: typeof price === 'number' ? price : undefined,
       category: category || 'General',
       images: uploadedUrls,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
 
-    db.saveProduct(newProduct);
+    await db.saveProduct(newProduct);
     res.status(201).json(newProduct);
   } catch (error) {
     console.error('Failed to create product:', error);
@@ -359,13 +430,13 @@ app.post('/api/products', authenticateToken, ownerRequired, async (req, res) => 
 });
 
 // GET /api/products (pagination, search, category filter)
-app.get('/api/products', authenticateToken, workerOrOwnerRequired, (req, res) => {
+app.get('/api/products', authenticateToken, workerOrOwnerRequired, async (req, res) => {
   const page = parseInt(req.query.page as string || '1', 10);
   const limit = parseInt(req.query.limit as string || '20', 10);
   const search = (req.query.search as string || '').toLowerCase();
   const category = (req.query.category as string || '').toLowerCase();
 
-  let products = db.getProducts();
+  let products = await db.getProducts();
 
   if (category) {
     products = products.filter(p => p.category.toLowerCase() === category);
@@ -381,6 +452,12 @@ app.get('/api/products', authenticateToken, workerOrOwnerRequired, (req, res) =>
   const total = products.length;
   const startIndex = (page - 1) * limit;
   const paginated = products.slice(startIndex, startIndex + limit);
+  // Attempt to migrate images for returned products in the background (await briefly to persist)
+  for (const p of paginated) {
+    // best-effort migration
+    // eslint-disable-next-line no-await-in-loop
+    await migrateProductImages(p);
+  }
 
   res.json({
     total,
@@ -390,24 +467,25 @@ app.get('/api/products', authenticateToken, workerOrOwnerRequired, (req, res) =>
   });
 });
 
-app.get('/api/products/:id', authenticateToken, workerOrOwnerRequired, (req, res) => {
-  const product = db.getProductById(req.params.id);
+app.get('/api/products/:id', authenticateToken, workerOrOwnerRequired, async (req, res) => {
+  const product = await db.getProductById(req.params.id);
   if (!product) {
     res.status(404).json({ error: 'Product not found' });
     return;
   }
+  await migrateProductImages(product);
   res.json(product);
 });
 
 app.put('/api/products/:id', authenticateToken, ownerRequired, async (req, res) => {
   const { id } = req.params;
-  const product = db.getProductById(id);
+  const product = await db.getProductById(id);
   if (!product) {
     res.status(404).json({ error: 'Product not found' });
     return;
   }
 
-  const { name, description, category, images } = req.body;
+  const { name, description, category, images, price } = req.body;
 
   try {
     const uploadedUrls: string[] = [];
@@ -420,15 +498,16 @@ app.put('/api/products/:id', authenticateToken, ownerRequired, async (req, res) 
       }
     }
 
-    product.name = name !== undefined ? name : product.name;
-    product.description = description !== undefined ? description : product.description;
-    product.category = category !== undefined ? category : product.category;
+  product.name = name !== undefined ? name : product.name;
+  product.description = description !== undefined ? description : product.description;
+  product.category = category !== undefined ? category : product.category;
+  product.price = typeof price === 'number' ? price : product.price;
     if (images !== undefined) {
       product.images = uploadedUrls;
     }
     product.updated_at = new Date().toISOString();
 
-    db.saveProduct(product);
+    await db.saveProduct(product);
     res.json(product);
   } catch (error) {
     console.error('Failed to update product:', error);
@@ -436,8 +515,8 @@ app.put('/api/products/:id', authenticateToken, ownerRequired, async (req, res) 
   }
 });
 
-app.delete('/api/products/:id', authenticateToken, ownerRequired, (req, res) => {
-  const product = db.getProductById(req.params.id);
+app.delete('/api/products/:id', authenticateToken, ownerRequired, async (req, res) => {
+  const product = await db.getProductById(req.params.id);
   if (!product) {
     res.status(404).json({ error: 'Product not found' });
     return;
@@ -446,7 +525,7 @@ app.delete('/api/products/:id', authenticateToken, ownerRequired, (req, res) => 
   // Soft delete representation
   product.is_deleted = true;
   product.updated_at = new Date().toISOString();
-  db.saveProduct(product);
+  await db.saveProduct(product);
 
   res.json({ success: true, message: 'Product soft deleted successfully' });
 });
@@ -454,7 +533,7 @@ app.delete('/api/products/:id', authenticateToken, ownerRequired, (req, res) => 
 // -------------------------------------------------------------
 // Catalog APIs (Owner and Workers both create, update, delete own/all)
 // -------------------------------------------------------------
-app.post('/api/catalogs', authenticateToken, workerOrOwnerRequired, (req, res) => {
+app.post('/api/catalogs', authenticateToken, workerOrOwnerRequired, async (req, res) => {
   const { title, product_ids } = req.body;
   if (!title || !product_ids || !Array.isArray(product_ids)) {
     res.status(400).json({ error: 'Catalog title and product IDs array are required' });
@@ -480,16 +559,16 @@ app.post('/api/catalogs', authenticateToken, workerOrOwnerRequired, (req, res) =
     created_at: new Date().toISOString(),
   };
 
-  db.saveCatalog(newCatalog);
+  await db.saveCatalog(newCatalog);
   res.status(201).json(newCatalog);
 });
 
 // GET /api/catalogs
 // Owner: Returns all catalogs.
 // Worker: Returns own catalogs only.
-app.get('/api/catalogs', authenticateToken, workerOrOwnerRequired, (req, res) => {
+app.get('/api/catalogs', authenticateToken, workerOrOwnerRequired, async (req, res) => {
   const user = (req as CustomRequest).user!;
-  const catalogs = db.getCatalogs();
+  const catalogs = await db.getCatalogs();
 
   if (user.role === 'owner') {
     res.json(catalogs);
@@ -500,10 +579,10 @@ app.get('/api/catalogs', authenticateToken, workerOrOwnerRequired, (req, res) =>
   }
 });
 
-app.get('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, (req, res) => {
+app.get('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, async (req, res) => {
   const { id } = req.params;
   const user = (req as CustomRequest).user!;
-  const catalog = db.getCatalogById(id);
+  const catalog = await db.getCatalogById(id);
 
   if (!catalog) {
     res.status(404).json({ error: 'Catalog not found' });
@@ -519,10 +598,10 @@ app.get('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, (req, res
   res.json(catalog);
 });
 
-app.put('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, (req, res) => {
+app.put('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, async (req, res) => {
   const { id } = req.params;
   const user = (req as CustomRequest).user!;
-  const catalog = db.getCatalogById(id);
+  const catalog = await db.getCatalogById(id);
 
   if (!catalog) {
     res.status(404).json({ error: 'Catalog not found' });
@@ -544,14 +623,14 @@ app.put('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, (req, res
     catalog.product_ids = product_ids;
   }
 
-  db.saveCatalog(catalog);
+  await db.saveCatalog(catalog);
   res.json(catalog);
 });
 
-app.delete('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, (req, res) => {
+app.delete('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, async (req, res) => {
   const { id } = req.params;
   const user = (req as CustomRequest).user!;
-  const catalog = db.getCatalogById(id);
+  const catalog = await db.getCatalogById(id);
 
   if (!catalog) {
     res.status(404).json({ error: 'Catalog not found' });
@@ -564,16 +643,16 @@ app.delete('/api/catalogs/:id', authenticateToken, workerOrOwnerRequired, (req, 
     return;
   }
 
-  db.deleteCatalog(id);
+  await db.deleteCatalog(id);
   res.json({ success: true, message: 'Catalog deleted successfully' });
 });
 
 // -------------------------------------------------------------
 // Public APIs (No authentication required)
 // -------------------------------------------------------------
-app.get('/api/public/catalogs/:slug', (req, res) => {
+app.get('/api/public/catalogs/:slug', async (req, res) => {
   const { slug } = req.params;
-  const catalog = db.getCatalogBySlug(slug);
+  const catalog = await db.getCatalogBySlug(slug);
 
   if (!catalog) {
     res.status(404).json({ error: 'Catalog resource not found' });
@@ -581,9 +660,16 @@ app.get('/api/public/catalogs/:slug', (req, res) => {
   }
 
   // Get full details of active products in catalog
-  const products = catalog.product_ids
-    .map(pId => db.getProductById(pId))
-    .filter((p): p is Product => p !== undefined);
+  const productsArr = await Promise.all(catalog.product_ids.map(async (pId) => await db.getProductById(pId)));
+  const products = productsArr.filter((p): p is Product => !!p && !p.is_deleted);
+
+  const settings = await db.getSettings();
+
+  // Attempt to migrate images for returned products
+  for (const p of products) {
+    // eslint-disable-next-line no-await-in-loop
+    await migrateProductImages(p);
+  }
 
   res.json({
     catalog: {
@@ -593,33 +679,58 @@ app.get('/api/public/catalogs/:slug', (req, res) => {
       created_at: catalog.created_at,
     },
     products: products,
-    settings: db.getSettings(),
+    settings,
   });
 });
 
 // Directly support FastAPI-style `/public/catalogs/{slug}` without `/api` prefix
-app.get('/public/catalogs/:slug', (req, res) => {
-  const catalog = db.getCatalogBySlug(req.params.slug);
+app.get('/public/catalogs/:slug', async (req, res) => {
+  const catalog = await db.getCatalogBySlug(req.params.slug);
   if (!catalog) {
     res.status(404).json({ error: 'Catalog not found' });
     return;
   }
-  const products = catalog.product_ids
-    .map(pId => db.getProductById(pId))
-    .filter((p): p is Product => p !== undefined);
-  res.json({ catalog, products, settings: db.getSettings() });
+  const productsArr = await Promise.all(catalog.product_ids.map(async (pId) => await db.getProductById(pId)));
+  const products = productsArr.filter((p): p is Product => !!p && !p.is_deleted);
+  const settings = await db.getSettings();
+  for (const p of products) {
+    // eslint-disable-next-line no-await-in-loop
+    await migrateProductImages(p);
+  }
+  res.json({ catalog, products, settings });
 });
 
 // -------------------------------------------------------------
 // Settings APIs
 // -------------------------------------------------------------
-app.get('/api/settings', (req, res) => {
-  res.json(db.getSettings());
+app.get('/api/settings', async (req, res) => {
+  let settings = await db.getSettings();
+
+  try {
+    // If shop_logo is a local uploads path, attempt to migrate it to Cloudinary
+    if (isCloudinaryConfigured && settings && settings.shop_logo && (settings.shop_logo.startsWith('/uploads') || settings.shop_logo.startsWith('uploads'))) {
+      const localPath = path.join(process.cwd(), settings.shop_logo.startsWith('/') ? settings.shop_logo.substr(1) : settings.shop_logo);
+      if (fs.existsSync(localPath)) {
+        try {
+          const resUpload = await cloudinary.uploader.upload(localPath, { folder: 'shop_catalogs' });
+          settings.shop_logo = resUpload.secure_url;
+          // Persist updated settings back to DB
+          await db.saveSettings(settings);
+        } catch (e) {
+          console.error('Failed to migrate local shop_logo to Cloudinary:', e);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error while attempting settings migration:', err);
+  }
+
+  res.json(settings);
 });
 
 app.put('/api/settings', authenticateToken, ownerRequired, async (req, res) => {
   const { shop_name, shop_logo, phone, whatsapp, address } = req.body;
-  const currentSettings = db.getSettings();
+  const currentSettings = await db.getSettings();
 
   try {
     let logoUrl = currentSettings.shop_logo;
@@ -637,7 +748,7 @@ app.put('/api/settings', authenticateToken, ownerRequired, async (req, res) => {
       address: address !== undefined ? address : currentSettings.address,
     };
 
-    db.saveSettings(updatedSettings);
+    await db.saveSettings(updatedSettings);
     res.json(updatedSettings);
   } catch (error) {
     console.error('Failed to update settings:', error);
@@ -648,10 +759,14 @@ app.put('/api/settings', authenticateToken, ownerRequired, async (req, res) => {
 // -------------------------------------------------------------
 // Dashboard API
 // -------------------------------------------------------------
-app.get('/api/dashboard/stats', authenticateToken, ownerRequired, (req, res) => {
-  const totalProducts = db.getProducts().length;
-  const totalCatalogs = db.getCatalogs().length;
-  const totalWorkers = db.getUsers().filter(u => u.role === 'worker').length;
+app.get('/api/dashboard/stats', authenticateToken, ownerRequired, async (req, res) => {
+  const products = await db.getProducts();
+  const catalogs = await db.getCatalogs();
+  const users = await db.getUsers();
+
+  const totalProducts = products.length;
+  const totalCatalogs = catalogs.length;
+  const totalWorkers = users.filter(u => u.role === 'worker').length;
 
   res.json({
     total_products: totalProducts,
@@ -661,11 +776,15 @@ app.get('/api/dashboard/stats', authenticateToken, ownerRequired, (req, res) => 
 });
 
 // Support FastAPI style for workers too
-app.get('/dashboard/stats', authenticateToken, ownerRequired, (req, res) => {
+app.get('/dashboard/stats', authenticateToken, ownerRequired, async (req, res) => {
+  const products = await db.getProducts();
+  const catalogs = await db.getCatalogs();
+  const users = await db.getUsers();
+
   res.json({
-    total_products: db.getProducts().length,
-    total_catalogs: db.getCatalogs().length,
-    total_workers: db.getUsers().filter(u => u.role === 'worker').length,
+    total_products: products.length,
+    total_catalogs: catalogs.length,
+    total_workers: users.filter(u => u.role === 'worker').length,
   });
 });
 
@@ -714,6 +833,29 @@ async function startViteServer() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
+    // Prevent noisy console errors from lucide-react missing/invalid source maps by
+    // intercepting requests for its .map files and returning empty responses.
+    // This is a dev-only workaround for versions of lucide-react that reference
+    // source maps which aren't present or are malformed.
+    app.use((req, res, next) => {
+      try {
+        let url = req.originalUrl || req.url || '';
+        // Normalize Windows backslashes which may appear in some resolved paths
+        url = String(url).replace(/\\/g, '/');
+        const lower = url.toLowerCase();
+
+        // If this looks like a node_modules or vite-resolved file map request,
+        // short-circuit with 204. This is a dev-only suppression for packages
+        // (like lucide-react) that reference missing or malformed .map files.
+        if (lower.endsWith('.map') && (lower.includes('node_modules') || lower.includes('/@fs/') || lower.includes('/@id/'))) {
+          res.status(204).end();
+          return;
+        }
+      } catch (e) {
+        // swallow middleware errors to avoid breaking dev server
+      }
+      next();
+    });
     app.use(vite.middlewares);
     console.log('Vite loaded in Development Mode Middleware.');
   } else {
@@ -726,7 +868,12 @@ async function startViteServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Express application active on http://0.0.0.0:${PORT}`);
+    const host = '0.0.0.0';
+    console.log(`Express application active on http://${host}:${PORT}`);
+    // Helpful reminder for local access using localhost
+    if (host === '0.0.0.0') {
+      console.log(`Also accessible on http://localhost:${PORT}`);
+    }
   });
 }
 

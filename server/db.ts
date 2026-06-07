@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
+import { MongoClient, Db, WithId } from 'mongodb';
 
 export interface User {
   _id: string;
@@ -16,6 +17,7 @@ export interface Product {
   _id: string;
   name: string;
   description: string;
+  price?: number;
   images: string[];
   category: string;
   created_at: string;
@@ -41,82 +43,76 @@ export interface Settings {
   address: string;
 }
 
-export interface DatabaseState {
-  users: User[];
-  products: Product[];
-  catalogs: Catalog[];
-  settings: Settings;
-}
-
+// Helper: load local JSON (if exists) for optional one-time migration
 const DB_FILE = path.join(process.cwd(), 'data', 'db.json');
 
-class Database {
-  private state: DatabaseState;
+class MongoDatabase {
+  private client: MongoClient;
+  private db?: Db;
 
   constructor() {
-    this.state = {
-      users: [],
-      products: [],
-      catalogs: [],
-      settings: {
-        shop_name: 'ABC Electronics',
-        shop_logo: '',
-        phone: '+1234567890',
-        whatsapp: '+1234567890',
-        address: '123 Tech Avenue, Silicon Valley',
-      },
-    };
-    this.load();
-    this.seed();
+    const uri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017';
+    this.client = new MongoClient(uri);
   }
 
-  private load() {
-    try {
-      const dir = path.dirname(DB_FILE);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
+  async connect(): Promise<void> {
+    if (!this.db) {
+      await this.client.connect();
+      this.db = this.client.db(process.env.MONGO_DB_NAME || 'the_shop_catalog');
 
-      if (fs.existsSync(DB_FILE)) {
-        const fileContent = fs.readFileSync(DB_FILE, 'utf-8');
-        const parsed = JSON.parse(fileContent);
-        this.state = {
-          users: parsed.users || [],
-          products: parsed.products || [],
-          catalogs: parsed.catalogs || [],
-          settings: parsed.settings || {
-            shop_name: 'ABC Electronics',
-            shop_logo: '',
-            phone: '+1234567890',
-            whatsapp: '+1234567890',
-            address: '123 Tech Avenue, Silicon Valley',
-          },
-        };
-      } else {
-        this.save();
+      // Optional migration from JSON file if flag set
+      if (process.env.MIGRATE_FROM_JSON === 'true') {
+        await this.migrateFromJsonIfNeeded();
       }
-    } catch (e) {
-      console.error('Failed to load database, using empty state:', e);
+      await this.seedDefaultOwner();
     }
   }
 
-  private save() {
+  // --- Migration helper ---
+  private async migrateFromJsonIfNeeded() {
     try {
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.state, null, 2), 'utf-8');
+      if (!fs.existsSync(DB_FILE)) return;
+      const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+
+      const users = parsed.users || [];
+      const products = parsed.products || [];
+      const catalogs = parsed.catalogs || [];
+      const settings = parsed.settings || null;
+
+      const usersColl = this.db!.collection('users');
+      const productsColl = this.db!.collection('products');
+      const catalogsColl = this.db!.collection('catalogs');
+      const settingsColl = this.db!.collection('settings');
+
+      // Simple upserts by _id
+      for (const u of users) {
+        await usersColl.updateOne({ _id: u._id }, { $set: u }, { upsert: true });
+      }
+      for (const p of products) {
+        await productsColl.updateOne({ _id: p._id }, { $set: p }, { upsert: true });
+      }
+      for (const c of catalogs) {
+        await catalogsColl.updateOne({ _id: c._id }, { $set: c }, { upsert: true });
+      }
+      if (settings) {
+        await settingsColl.updateOne({}, { $set: settings }, { upsert: true });
+      }
+
+      console.log('Migration from data/db.json to MongoDB completed (MIGRATE_FROM_JSON=true).');
     } catch (e) {
-      console.error('Failed to save database:', e);
+      console.error('Migration failed:', e);
     }
   }
 
-  private seed() {
-    // Seed default owner account if no users exist
+  private async seedDefaultOwner() {
+    const usersColl = this.db!.collection<User>('users');
     const ownerEmail = 'owner@gmail.com';
-    const existingOwner = this.state.users.find(u => u.email.toLowerCase() === ownerEmail.toLowerCase());
-    
-    if (!existingOwner) {
+    const existing = await usersColl.findOne({ email: { $regex: new RegExp(`^${ownerEmail}$`, 'i') } });
+    if (!existing) {
       const salt = bcrypt.genSaltSync(10);
       const hash = bcrypt.hashSync('123456', salt);
-      const defaultOwner: User = {
+      await usersColl.insertOne({
         _id: 'owner-default-id',
         name: 'Shop Owner',
         email: ownerEmail,
@@ -124,104 +120,125 @@ class Database {
         role: 'owner',
         is_active: true,
         created_at: new Date().toISOString(),
-      };
-      
-      this.state.users.push(defaultOwner);
-      this.save();
-      console.log('Database seeded with default owner Account (owner@gmail.com / 123456)');
+      });
+      console.log('MongoDB seeded with default owner Account (owner@gmail.com / 123456)');
     }
   }
 
-  // User APIs
-  getUsers(): User[] {
-    return this.state.users;
+  // --- User APIs ---
+  async getUsers(): Promise<User[]> {
+    await this.connect();
+    return this.db!.collection<User>('users').find().toArray();
   }
 
-  getUserById(id: string): User | undefined {
-    return this.state.users.find(u => u._id === id);
+  async getUserById(id: string): Promise<User | null> {
+    await this.connect();
+    return this.db!.collection<User>('users').findOne({ _id: id });
   }
 
-  getUserByEmail(email: string): User | undefined {
-    return this.state.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+  async getUserByEmail(email: string): Promise<User | null> {
+    await this.connect();
+    return this.db!.collection<User>('users').findOne({ email: { $regex: new RegExp(`^${email}$`, 'i') } });
   }
 
-  saveUser(user: User): User {
-    const idx = this.state.users.findIndex(u => u._id === user._id);
-    if (idx >= 0) {
-      this.state.users[idx] = user;
-    } else {
-      this.state.users.push(user);
-    }
-    this.save();
+  async saveUser(user: User): Promise<User> {
+    await this.connect();
+    await this.db!.collection<User>('users').updateOne({ _id: user._id }, { $set: user }, { upsert: true });
     return user;
   }
 
-  // Product APIs
-  getProducts(): Product[] {
-    // Exclude soft deleted products by default
-    return this.state.products.filter(p => !p.is_deleted);
+  // --- Product APIs ---
+  async getProducts(): Promise<Product[]> {
+    await this.connect();
+    return this.db!.collection<Product>('products').find({ is_deleted: { $ne: true } }).toArray();
   }
 
-  getProductById(id: string): Product | undefined {
-    const p = this.state.products.find(p => p._id === id);
-    return p && !p.is_deleted ? p : undefined;
+  async getProductById(id: string): Promise<Product | null> {
+    await this.connect();
+    return this.db!.collection<Product>('products').findOne({ _id: id, is_deleted: { $ne: true } });
   }
 
-  saveProduct(product: Product): Product {
-    const idx = this.state.products.findIndex(p => p._id === product._id);
-    if (idx >= 0) {
-      this.state.products[idx] = product;
-    } else {
-      this.state.products.push(product);
-    }
-    this.save();
+  async saveProduct(product: Product): Promise<Product> {
+    await this.connect();
+    await this.db!.collection<Product>('products').updateOne({ _id: product._id }, { $set: product }, { upsert: true });
     return product;
   }
 
-  // Catalog APIs
-  getCatalogs(): Catalog[] {
-    return this.state.catalogs;
+  // --- Catalog APIs ---
+  async getCatalogs(): Promise<Catalog[]> {
+    await this.connect();
+    return this.db!.collection<Catalog>('catalogs').find().toArray();
   }
 
-  getCatalogById(id: string): Catalog | undefined {
-    return this.state.catalogs.find(c => c._id === id);
+  async getCatalogById(id: string): Promise<Catalog | null> {
+    await this.connect();
+    return this.db!.collection<Catalog>('catalogs').findOne({ _id: id });
   }
 
-  getCatalogBySlug(slug: string): Catalog | undefined {
-    return this.state.catalogs.find(c => c.slug === slug);
+  async getCatalogBySlug(slug: string): Promise<Catalog | null> {
+    await this.connect();
+    return this.db!.collection<Catalog>('catalogs').findOne({ slug });
   }
 
-  saveCatalog(catalog: Catalog): Catalog {
-    const idx = this.state.catalogs.findIndex(c => c._id === catalog._id);
-    if (idx >= 0) {
-      this.state.catalogs[idx] = catalog;
-    } else {
-      this.state.catalogs.push(catalog);
-    }
-    this.save();
+  async saveCatalog(catalog: Catalog): Promise<Catalog> {
+    await this.connect();
+    await this.db!.collection<Catalog>('catalogs').updateOne({ _id: catalog._id }, { $set: catalog }, { upsert: true });
     return catalog;
   }
 
-  deleteCatalog(id: string): boolean {
-    const idx = this.state.catalogs.findIndex(c => c._id === id);
-    if (idx >= 0) {
-      this.state.catalogs.splice(idx, 1);
-      this.save();
-      return true;
-    }
-    return false;
+  async deleteCatalog(id: string): Promise<boolean> {
+    await this.connect();
+    const res = await this.db!.collection<Catalog>('catalogs').deleteOne({ _id: id });
+    return res.deletedCount === 1;
   }
 
-  // Settings APIs
-  getSettings(): Settings {
-    return this.state.settings;
+  // --- Settings ---
+  async getSettings(): Promise<Settings> {
+    await this.connect();
+    const s = await this.db!.collection<Settings>('settings').findOne({});
+    if (s) return s;
+    const defaultSettings: Settings = {
+      shop_name: 'The Apna Bazar Mobile',
+      shop_logo: '',
+      phone: '+919099396065',
+      whatsapp: '+919099396065',
+      address: '123 Tech Avenue, Mota Varachha, Surat',
+    };
+    await this.db!.collection<Settings>('settings').insertOne(defaultSettings as any);
+    return defaultSettings;
   }
 
-  saveSettings(settings: Settings): Settings {
-    this.state.settings = settings;
-    this.save();
-    return this.state.settings;
+  async saveSettings(settings: Settings): Promise<Settings> {
+    await this.connect();
+    await this.db!.collection<Settings>('settings').updateOne({}, { $set: settings }, { upsert: true });
+    return settings;
   }
 }
 
-export const db = new Database();
+// Export a single db instance that matches the previous API surface but backed by Mongo
+const mongoDb = new MongoDatabase();
+
+export const db = {
+  // User APIs
+  getUsers: () => mongoDb.getUsers(),
+  getUserById: (id: string) => mongoDb.getUserById(id),
+  getUserByEmail: (email: string) => mongoDb.getUserByEmail(email),
+  saveUser: (user: User) => mongoDb.saveUser(user),
+
+  // Product APIs
+  getProducts: () => mongoDb.getProducts(),
+  getProductById: (id: string) => mongoDb.getProductById(id),
+  saveProduct: (product: Product) => mongoDb.saveProduct(product),
+
+  // Catalog APIs
+  getCatalogs: () => mongoDb.getCatalogs(),
+  getCatalogById: (id: string) => mongoDb.getCatalogById(id),
+  getCatalogBySlug: (slug: string) => mongoDb.getCatalogBySlug(slug),
+  saveCatalog: (catalog: Catalog) => mongoDb.saveCatalog(catalog),
+  deleteCatalog: (id: string) => mongoDb.deleteCatalog(id),
+
+  // Settings
+  getSettings: () => mongoDb.getSettings(),
+  saveSettings: (settings: Settings) => mongoDb.saveSettings(settings),
+} as const;
+

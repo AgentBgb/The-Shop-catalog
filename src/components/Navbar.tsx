@@ -40,7 +40,6 @@ export default function Navbar({ onToggleSidebar }: NavbarProps) {
           <span className="font-bold text-slate-800 tracking-tight leading-tight" id="navbar-shop-name">
             {settings?.shop_name || 'My Shop'}
           </span>
-          <span className="text-[10px] text-slate-400 font-mono tracking-wider">OFFLINE INDEX ENGINE</span>
         </div>
       </div>
 

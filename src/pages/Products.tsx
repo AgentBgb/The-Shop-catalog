@@ -219,9 +219,14 @@ export default function Products() {
                     <h3 className="font-bold text-slate-800 leading-tight line-clamp-1" title={product.name} id={`product-name-txt-${product._id}`}>
                       {product.name}
                     </h3>
-                    <p className="text-xs text-slate-400 line-clamp-2 h-8 leading-relaxed" id={`product-desc-txt-${product._id}`}>
-                      {product.description || 'No descriptive summary specified.'}
-                    </p>
+                    <div className="flex items-baseline justify-between">
+                      <p className="text-xs text-slate-400 line-clamp-2 h-8 leading-relaxed" id={`product-desc-txt-${product._id}`}>
+                        {product.description || 'No descriptive summary specified.'}
+                      </p>
+                      {typeof product.price === 'number' && (
+                        <div className="text-sm font-bold text-slate-800 ml-3">₹{product.price.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
+                      )}
+                    </div>
                   </div>
 
                   <div className="flex items-center justify-between border-t border-slate-50 pt-3 mt-1" id={`product-actions-${product._id}`}>
