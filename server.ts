@@ -860,8 +860,20 @@ async function startViteServer() {
     console.log('Vite loaded in Development Mode Middleware.');
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    // Serve static assets (but skip /api routes to let API handlers take priority)
+    app.use((req, res, next) => {
+      if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) {
+        return next();
+      }
+      express.static(distPath)(req, res, next);
+    });
+    // SPA fallback: Redirect non-API routes to index.html for client-side routing
     app.get('*', (req, res) => {
+      // Don't serve index.html for API routes
+      if (req.path.startsWith('/api/')) {
+        res.status(404).json({ error: 'API route not found' });
+        return;
+      }
       res.sendFile(path.join(distPath, 'index.html'));
     });
     console.log('Production Single-Page Application assets mounted.');
